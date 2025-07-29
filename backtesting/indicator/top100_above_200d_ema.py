@@ -164,15 +164,16 @@ def is_stablecoin(coingecko_id):
         return False
 
 
-def get_top_n_coins(n=100):
+def get_top_n_coins(n=100, max_batches=10):
     """
-    Fetch at least n coins from CoinMarketCap, handling pagination.
+    Fetch at least n coins from CoinMarketCap, handling pagination and allowing for more batches if needed.
     Returns a list of dicts with 'symbol', 'name', and 'slug'.
     """
     coins = []
     start = 1
     batch_size = 100
-    while len(coins) < n:
+    batch_count = 0
+    while len(coins) < n * 2 and batch_count < max_batches:
         headers = {
             'Accepts': 'application/json',
             'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY,
@@ -196,7 +197,8 @@ def get_top_n_coins(n=100):
             break  # No more coins available
         coins.extend(batch)
         start += batch_size
-    return coins[:n*2]  # Fetch extra in case of exclusions
+        batch_count += 1
+    return coins
 
 
 def main():
@@ -205,35 +207,60 @@ def main():
           "Subsequent runs will be much faster and offline-friendly.\n" \
           "If you want to pre-populate the cache, run the script once and let it finish, or download JSONs to the 'cache' folder.")
     # Step 1: Get a large enough list of coins from CoinMarketCap
-    coins = get_top_n_coins(100)
-    # Step 2: Get the full CoinGecko coins list for mapping
-    coingecko_coins = get_coingecko_coins_list()
-    above_ema_count = 0  # Counter for coins above their 200D EMA
-    total = 0            # Counter for successfully analyzed coins
-    results = []         # List to store results for CSV export
+    coins = []
     analyzed = 0
     idx = 0
-    while analyzed < 100 and idx < len(coins):
+    total_processed = 0
+    results = []
+    batch_size = 100
+    fetch_start = 1
+    max_batches = 20  # Allow up to 2000 coins if needed
+    coingecko_coins = get_coingecko_coins_list()
+    above_ema_count = 0
+    total = 0
+    while analyzed < 100 and fetch_start < batch_size * max_batches:
+        # Fetch next batch if needed
+        if idx >= len(coins):
+            headers = {
+                'Accepts': 'application/json',
+                'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY,
+            }
+            params = {
+                'start': str(fetch_start),
+                'limit': str(batch_size),
+                'convert': 'USD'
+            }
+            response = requests.get(COINMARKETCAP_URL, headers=headers, params=params)
+            data = response.json()
+            batch = [
+                {
+                    'symbol': coin['symbol'],
+                    'name': coin['name'],
+                    'slug': coin['slug']
+                }
+                for coin in data['data']
+            ]
+            if not batch:
+                break
+            coins.extend(batch)
+            fetch_start += batch_size
         coin = coins[idx]
         idx += 1
-        # Step 3: Map CoinMarketCap coin to CoinGecko id
+        total_processed += 1
         coingecko_id = map_cmc_to_coingecko(coin, coingecko_coins)
         if not coingecko_id:
             print(f"No CoinGecko id found for {coin['name']} ({coin['symbol']})")
             continue
-        # Exclude stablecoins
         if is_stablecoin(coingecko_id):
             print(f"Skipping stablecoin: {coin['name']} ({coin['symbol']})")
             continue
         print(f"Processing {coin['name']} ({coin['symbol']}) as CoinGecko id '{coingecko_id}'...")
-        # Step 4: Get historical prices (from cache or API)
         df = get_historical_prices(coingecko_id, use_cache=True)
         if df is None or len(df) < 2:
             print(f"Not enough data for {coin['name']}")
             continue
         if len(df) < 200:
             print(f"Warning: Only {len(df)} days of data for {coin['name']}, EMA will be less accurate.")
-        # Step 5: Calculate the 200D EMA (or as many days as available)
         df = calculate_ema(df, span=min(200, len(df)))
         latest = df.iloc[-1]
         is_above = latest['close'] > latest['ema']
@@ -241,14 +268,12 @@ def main():
             above_ema_count += 1
         total += 1
         analyzed += 1
-        # Store results for CSV export
         results.append({
             'Coin Name': coin['name'],
             'Current Price': latest['close'],
             '200D EMA': latest['ema'],
             'Above EMA': 'Yes' if is_above else 'No'
         })
-        # Large delay to avoid rate limits, but skip if using cache
         if not os.path.exists(os.path.join(CACHE_DIR, f'{coingecko_id}_usd_365d.json')):
             time.sleep(15)
     if analyzed == 0:
@@ -257,11 +282,12 @@ def main():
     percent_above = (above_ema_count / analyzed) * 100
     print(f"\n{percent_above:.2f}% of Top 100 coins (excluding stablecoins) are trading above their 200D EMA.")
     print(f"Analyzed {analyzed} out of 100 coins successfully.")
+    print(f"Total coins processed (including skipped): {total_processed}")
 
     # Step 6: Export results to CSV for further analysis or sharing
     df_results = pd.DataFrame(results)
     output_path = os.path.join(os.path.dirname(__file__), 'top100_above_200d_ema_results.csv')
-    df_results.to_csv(output_path, index=False)
+    df_results.to_csv(output_path, index=False, mode='w')
     print(f"Results exported to {output_path}")
 
 if __name__ == "__main__":
